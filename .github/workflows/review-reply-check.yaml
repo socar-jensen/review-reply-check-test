@@ -87,7 +87,8 @@ jobs:
               return;
             }
 
-            // Check each resolved thread for PR author reply
+            // Check each resolved thread for PR author reply with keyword
+            const REQUIRED_KEYWORDS = ['반영', '미반영'];
             const violations = [];
 
             for (const thread of resolvedThreads) {
@@ -99,27 +100,40 @@ jobs:
               // Skip threads where the first comment author is deleted
               if (!firstComment.author) continue;
 
-              // Check if PR author replied (any comment after the first one)
-              const hasAuthorReply = comments.slice(1).some(
+              const isBot = firstComment.author.login.endsWith('[bot]') ||
+                firstComment.author.login === 'github-actions';
+              const location = firstComment.path
+                ? `${firstComment.path}${firstComment.line ? ':' + firstComment.line : ''}`
+                : '(file-level comment)';
+              const preview = firstComment.body.length > 80
+                ? firstComment.body.substring(0, 80) + '...'
+                : firstComment.body;
+
+              const authorReplies = comments.slice(1).filter(
                 c => c.author && c.author.login === prAuthor
               );
 
-              if (!hasAuthorReply) {
-                const isBot = firstComment.author.login.endsWith('[bot]') ||
-                  firstComment.author.login === 'github-actions';
-                const location = firstComment.path
-                  ? `${firstComment.path}${firstComment.line ? ':' + firstComment.line : ''}`
-                  : '(file-level comment)';
-                const preview = firstComment.body.length > 80
-                  ? firstComment.body.substring(0, 80) + '...'
-                  : firstComment.body;
-
+              if (authorReplies.length === 0) {
                 violations.push({
                   location,
                   preview,
                   url: firstComment.url,
                   isBot,
+                  reason: 'no_reply',
                 });
+              } else {
+                const hasKeyword = authorReplies.some(
+                  c => REQUIRED_KEYWORDS.some(kw => c.body.includes(kw))
+                );
+                if (!hasKeyword) {
+                  violations.push({
+                    location,
+                    preview,
+                    url: firstComment.url,
+                    isBot,
+                    reason: 'missing_keyword',
+                  });
+                }
               }
             }
 
@@ -131,10 +145,18 @@ jobs:
             // Build violation details
             const violationLines = violations.map(v => {
               const botTag = v.isBot ? ' [bot]' : '';
-              return `- ${v.location}${botTag} — "${v.preview}"\n  ${v.url}`;
+              const reasonTag = v.reason === 'missing_keyword'
+                ? ' ⚠️ reply는 있으나 "반영/미반영" 키워드 없음'
+                : '';
+              return `- ${v.location}${botTag} — "${v.preview}"${reasonTag}\n  ${v.url}`;
             });
 
-            const stats = `${violations.length}개 스레드 미응답 / 총 ${resolvedThreads.length}개 resolved 스레드`;
+            const noReplyCount = violations.filter(v => v.reason === 'no_reply').length;
+            const missingKeywordCount = violations.filter(v => v.reason === 'missing_keyword').length;
+            const statsParts = [];
+            if (noReplyCount > 0) statsParts.push(`${noReplyCount}개 미응답`);
+            if (missingKeywordCount > 0) statsParts.push(`${missingKeywordCount}개 키워드 누락`);
+            const stats = `${statsParts.join(' + ')} / 총 ${resolvedThreads.length}개 resolved 스레드`;
 
             if (isMerged) {
               // Post-merge: PR comment notification
@@ -142,8 +164,8 @@ jobs:
                 `> [!WARNING]`,
                 `> **Review Reply Check**`,
                 `>`,
-                `> @${prAuthor} 님, 머지된 PR에 반영여부 reply가 누락된 리뷰 스레드가 있습니다.`,
-                `> 다음 PR부터는 resolve 전에 반영/미반영 + 사유를 코멘트로 남겨주세요.`,
+                `> @${prAuthor} 님, 머지된 PR에 반영여부 reply가 없거나 키워드가 누락된 리뷰 스레드가 있습니다.`,
+                `> 다음 PR부터는 resolve 전에 "반영" 또는 "미반영" 키워드를 포함한 코멘트를 남겨주세요.`,
                 ``,
                 ...violationLines,
                 ``,
@@ -163,8 +185,8 @@ jobs:
               const message = [
                 `⚠️ Review Reply Check Failed`,
                 ``,
-                `@${prAuthor} 님, 다음 리뷰 스레드에 반영여부 reply가 없습니다.`,
-                `Resolve 전에 반영/미반영 + 사유를 코멘트로 남겨주세요.`,
+                `@${prAuthor} 님, 다음 리뷰 스레드에 반영여부 reply가 없거나 키워드가 누락되었습니다.`,
+                `Resolve 전에 "반영" 또는 "미반영" 키워드를 포함한 코멘트를 남겨주세요.`,
                 ``,
                 ...violationLines,
                 ``,
