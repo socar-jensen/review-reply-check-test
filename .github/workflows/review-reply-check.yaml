@@ -1,0 +1,145 @@
+name: Review Reply Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: review-reply-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-review-replies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check review thread replies
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prAuthor = context.payload.pull_request.user.login;
+
+            // GraphQL query to fetch all review threads with pagination
+            const query = `
+              query($owner: String!, $repo: String!, $prNumber: Int!, $cursor: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $prNumber) {
+                    reviewThreads(first: 100, after: $cursor) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        isResolved
+                        comments(first: 100) {
+                          nodes {
+                            author {
+                              login
+                            }
+                            body
+                            url
+                            path
+                            line
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            // Fetch all review threads with pagination
+            let allThreads = [];
+            let cursor = null;
+            let hasNextPage = true;
+
+            while (hasNextPage) {
+              const result = await github.graphql(query, {
+                owner,
+                repo,
+                prNumber,
+                cursor,
+              });
+
+              const reviewThreads = result.repository.pullRequest.reviewThreads;
+              allThreads = allThreads.concat(reviewThreads.nodes);
+              hasNextPage = reviewThreads.pageInfo.hasNextPage;
+              cursor = reviewThreads.pageInfo.endCursor;
+            }
+
+            // Filter resolved threads
+            const resolvedThreads = allThreads.filter(t => t.isResolved);
+
+            if (resolvedThreads.length === 0) {
+              core.info('No resolved review threads found. Passing.');
+              return;
+            }
+
+            // Check each resolved thread for PR author reply
+            const violations = [];
+
+            for (const thread of resolvedThreads) {
+              const comments = thread.comments.nodes;
+              if (comments.length === 0) continue;
+
+              const firstComment = comments[0];
+
+              // Skip threads where the first comment author is deleted
+              if (!firstComment.author) continue;
+
+              // Check if PR author replied (any comment after the first one)
+              const hasAuthorReply = comments.slice(1).some(
+                c => c.author && c.author.login === prAuthor
+              );
+
+              if (!hasAuthorReply) {
+                const isBot = firstComment.author.login.endsWith('[bot]') ||
+                  firstComment.author.login === 'github-actions';
+                const location = firstComment.path
+                  ? `${firstComment.path}${firstComment.line ? ':' + firstComment.line : ''}`
+                  : '(file-level comment)';
+                const preview = firstComment.body.length > 80
+                  ? firstComment.body.substring(0, 80) + '...'
+                  : firstComment.body;
+
+                violations.push({
+                  location,
+                  preview,
+                  url: firstComment.url,
+                  isBot,
+                });
+              }
+            }
+
+            if (violations.length === 0) {
+              core.info(`All ${resolvedThreads.length} resolved threads have author replies. Passing.`);
+              return;
+            }
+
+            // Build failure message
+            const lines = [
+              `⚠️ Review Reply Check Failed`,
+              ``,
+              `@${prAuthor} 님, 다음 리뷰 스레드에 반영여부 reply가 없습니다.`,
+              `Resolve 전에 반영/미반영 + 사유를 코멘트로 남겨주세요.`,
+              ``,
+            ];
+
+            for (const v of violations) {
+              const botTag = v.isBot ? ' [bot]' : '';
+              lines.push(`- ${v.location}${botTag} — "${v.preview}"`);
+              lines.push(`  ${v.url}`);
+            }
+
+            lines.push(``);
+            lines.push(`${violations.length}개 스레드 미응답 / 총 ${resolvedThreads.length}개 resolved 스레드`);
+
+            const message = lines.join('\n');
+            core.summary.addRaw(message);
+            await core.summary.write();
+            core.setFailed(message);
