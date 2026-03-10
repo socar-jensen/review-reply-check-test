@@ -10,6 +10,9 @@ concurrency:
   group: review-reply-check-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+permissions:
+  pull-requests: read
+
 jobs:
   check-review-replies:
     runs-on: ubuntu-latest
