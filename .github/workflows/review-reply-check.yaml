@@ -3,16 +3,21 @@ name: Review Reply Check
 on:
   pull_request_review:
     types: [submitted]
+  pull_request:
+    types: [closed]
 
 concurrency:
   group: review-reply-check-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   check-review-replies:
+    if: >-
+      github.event_name == 'pull_request_review' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     steps:
       - name: Check review thread replies
@@ -23,6 +28,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prAuthor = context.payload.pull_request.user.login;
+            const isMerged = context.eventName === 'pull_request' && context.payload.pull_request.merged;
 
             // GraphQL query to fetch all review threads with pagination
             const query = `
@@ -122,25 +128,50 @@ jobs:
               return;
             }
 
-            // Build failure message
-            const lines = [
-              `⚠️ Review Reply Check Failed`,
-              ``,
-              `@${prAuthor} 님, 다음 리뷰 스레드에 반영여부 reply가 없습니다.`,
-              `Resolve 전에 반영/미반영 + 사유를 코멘트로 남겨주세요.`,
-              ``,
-            ];
-
-            for (const v of violations) {
+            // Build violation details
+            const violationLines = violations.map(v => {
               const botTag = v.isBot ? ' [bot]' : '';
-              lines.push(`- ${v.location}${botTag} — "${v.preview}"`);
-              lines.push(`  ${v.url}`);
+              return `- ${v.location}${botTag} — "${v.preview}"\n  ${v.url}`;
+            });
+
+            const stats = `${violations.length}개 스레드 미응답 / 총 ${resolvedThreads.length}개 resolved 스레드`;
+
+            if (isMerged) {
+              // Post-merge: PR comment notification
+              const body = [
+                `> [!WARNING]`,
+                `> **Review Reply Check**`,
+                `>`,
+                `> @${prAuthor} 님, 머지된 PR에 반영여부 reply가 누락된 리뷰 스레드가 있습니다.`,
+                `> 다음 PR부터는 resolve 전에 반영/미반영 + 사유를 코멘트로 남겨주세요.`,
+                ``,
+                ...violationLines,
+                ``,
+                stats,
+              ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body,
+              });
+
+              core.warning(`Post-merge: ${stats}`);
+            } else {
+              // Pre-merge: block with setFailed
+              const message = [
+                `⚠️ Review Reply Check Failed`,
+                ``,
+                `@${prAuthor} 님, 다음 리뷰 스레드에 반영여부 reply가 없습니다.`,
+                `Resolve 전에 반영/미반영 + 사유를 코멘트로 남겨주세요.`,
+                ``,
+                ...violationLines,
+                ``,
+                stats,
+              ].join('\n');
+
+              core.summary.addRaw(message);
+              await core.summary.write();
+              core.setFailed(message);
             }
-
-            lines.push(``);
-            lines.push(`${violations.length}개 스레드 미응답 / 총 ${resolvedThreads.length}개 resolved 스레드`);
-
-            const message = lines.join('\n');
-            core.summary.addRaw(message);
-            await core.summary.write();
-            core.setFailed(message);
